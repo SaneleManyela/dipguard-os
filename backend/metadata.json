@@ -1,0 +1,6 @@
+{
+  "name": "DipGuard Quant",
+  "description": "DipGuard Quant is an autonomous financial intelligence agent focused on identifying high-conviction buy-the-dip opportunities in global growth equities and ETFs using an econophysics framework.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

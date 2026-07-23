@@ -1,0 +1,14 @@
+{
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express-rate-limit": "^8.6.0",
+    "qrcode": "^1.5.4",
+    "speakeasy": "^2.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.6",
+    "@types/speakeasy": "^2.0.10"
+  }
+}

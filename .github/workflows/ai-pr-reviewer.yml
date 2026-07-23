@@ -1,0 +1,38 @@
+name: "AI Code Review"
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+  pull_request_review_comment:
+    types:
+      - created
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: AI PR Reviewer
+        uses: coderabbitai/coderabbit-action@v1 # Example placeholder for CodeRabbit AI or a custom script
+        with:
+          # Step 2: Custom architecture & business logic prompt
+          system_message: |
+            You are an elite principal application security engineer. Your review must focus strictly on architecture, business logic correctness, and implementation of business rules. 
+            - IGNORE all syntax, style preferences, typos, and formatting issues.
+            - FLAG anything that touches auth, payment gateways, or data manipulation (specifically updates/deletions).
+            - AUDIT strictly for SQL injection vectors, unhandled edge cases, and N+1 queries.
+            - Provide actionable feedback on what would break in production, not what breaks a linter.
+          
+          # Step 3: Gate merges on review completion (Thresholds)
+          # Assuming the action can fail the build on critical findings
+          fail_on_critical: true
+          github_token: ${{ secrets.GITHUB_TOKEN }}
