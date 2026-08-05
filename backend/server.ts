@@ -9,6 +9,7 @@ import dotenv from "dotenv";
 import scannerRouter from './routes/scanner';
 import { startScheduler } from './services/scheduler';
 import { ReplicateProvider } from './llm/replicate_provider';
+import { initChatTables, saveChatMessage, saveChatAttachment, getChatHistory, getChatAttachmentById } from './services/chat';
 
 dotenv.config({ path: '../.env' });
 
@@ -65,6 +66,80 @@ app.use('/api', apiLimiter, scannerRouter);
 
 app.get('/health', (req: Request, res: Response) => {
     res.json({ status: 'ok', service: 'DipGuard Node Backend' });
+});
+
+app.get('/api/chat-history', async (req: Request, res: Response) => {
+  try {
+    const history = await getChatHistory(100);
+    res.json({ success: true, history });
+  } catch (err: any) {
+    console.error('Chat history error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/chat', upload.none(), async (req: Request, res: Response) => {
+  const { message } = req.body;
+  if (!message || typeof message !== 'string') {
+    return res.status(400).json({ success: false, error: 'Chat message is required.' });
+  }
+
+  const hasApi = hasReplicateToken();
+  const thesisPrompt = getCurrentThesisPrompt();
+  const systemPrompt = `You are DipGuard Quant, a specialized financial intelligence assistant. Maintain the following thesis as the core guidance for every answer:\n${thesisPrompt}`;
+  const userPrompt = `User asks: ${message}`;
+
+  const userChatId = await saveChatMessage('user', message);
+
+  if (!hasApi) {
+    const response = `[SIMULATED DipGuard] Using the primed thesis, I would answer: ${message}`;
+    const assistantChatId = await saveChatMessage('assistant', response, { simulated: true, chatId: userChatId });
+    return res.json({ success: true, response, userMessageId: userChatId, assistantMessageId: assistantChatId });
+  }
+
+  try {
+    const responseText = await getReplicateResponse(`${systemPrompt}\n\n${userPrompt}`);
+    const assistantChatId = await saveChatMessage('assistant', responseText.trim(), { chatId: userChatId });
+    res.json({ success: true, response: responseText.trim(), userMessageId: userChatId, assistantMessageId: assistantChatId });
+  } catch (err: any) {
+    console.error('Chat endpoint error:', err);
+    res.status(500).json({ success: false, error: err.message || 'Chat generation failed.' });
+  }
+});
+
+app.post('/api/chat-attachment', upload.single('attachment'), async (req: Request, res: Response) => {
+  const { chatId } = req.body;
+  const file = req.file;
+
+  if (!chatId || typeof chatId !== 'string') {
+    return res.status(400).json({ success: false, error: 'chatId is required.' });
+  }
+  if (!file) {
+    return res.status(400).json({ success: false, error: 'Attachment file is required.' });
+  }
+
+  try {
+    const attachment = await saveChatAttachment(chatId, file);
+    res.json({ success: true, attachment });
+  } catch (err: any) {
+    console.error('Chat attachment error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/chat-attachment/:id', async (req: Request, res: Response) => {
+  try {
+    const attachment = await getChatAttachmentById(req.params.id);
+    if (!attachment) {
+      return res.status(404).json({ success: false, error: 'Attachment not found.' });
+    }
+    res.setHeader('Content-Type', attachment.mimeType);
+    res.setHeader('Content-Disposition', `inline; filename="${attachment.filename}"`);
+    res.send(attachment.data);
+  } catch (err: any) {
+    console.error('Fetch attachment error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
@@ -555,6 +630,8 @@ Include specific insights on NASDAQ, JSE, and any statements by Jensen Huang or 
 
 // Serve Vite or static assets depending on environment
 async function initServer() {
+  await initChatTables();
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },

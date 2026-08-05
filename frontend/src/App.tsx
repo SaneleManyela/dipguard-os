@@ -16,6 +16,7 @@ import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.mjs';
 import { OpportunityAlert, ScheduledReport, LiveActivityLog, BriefType } from './types/types';
 import ActivityLogs from './components/ActivityLogs';
 import PlaygroundView from './components/PlaygroundView';
+import { fetchChatHistory, sendChatMessage, uploadChatAttachment } from './services/chatApi';
 
 GlobalWorkerOptions.workerSrc = pdfjsWorker;
 
@@ -112,8 +113,10 @@ export default function App() {
   const [thesisPrompt, setThesisPrompt] = useState<string>('');
   const [thesisDraft, setThesisDraft] = useState<string>('');
   const [chatInput, setChatInput] = useState<string>('');
-  const [chatMessages, setChatMessages] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
+  const [chatMessages, setChatMessages] = useState<{ id?: string; role: 'user' | 'assistant'; content: string; attachments?: Array<{ id: string; filename: string; mimeType: string; url: string }>; }[]>([]);
   const [isSendingChat, setIsSendingChat] = useState(false);
+  const [chatAttachment, setChatAttachment] = useState<File | null>(null);
+  const [chatUploadingAttachment, setChatUploadingAttachment] = useState(false);
   const [isUpdatingThesis, setIsUpdatingThesis] = useState(false);
 
   // Currency Converter Inputs
@@ -207,6 +210,15 @@ export default function App() {
         }
       })
       .catch((err) => console.warn('Could not load thesis prompt', err));
+
+    // Chat history
+    fetchChatHistory()
+      .then((data) => {
+        if (data.success) {
+          setChatMessages(data.history || []);
+        }
+      })
+      .catch((err) => console.warn('Could not load chat history', err));
   }, []);
 
   // Trigger Ticker Scan
@@ -298,8 +310,13 @@ export default function App() {
     }
   };
 
-  const addChatMessage = (message: string, role: 'user' | 'assistant') => {
-    setChatMessages((prev) => [...prev, { role, content: message }]);
+  const addChatMessage = (
+    message: string,
+    role: 'user' | 'assistant',
+    attachments?: Array<{ id: string; filename: string; mimeType: string; url: string }>,
+    id?: string
+  ) => {
+    setChatMessages((prev) => [...prev, { id, role, content: message, attachments }]);
   };
 
   const handleSendChat = async (e: FormEvent<HTMLFormElement>) => {
@@ -312,12 +329,7 @@ export default function App() {
     setIsSendingChat(true);
 
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: messageToSend }),
-      });
-      const data = await response.json();
+      const data = await sendChatMessage(messageToSend);
       if (data.success) {
         addChatMessage(data.response, 'assistant');
       } else {
@@ -327,6 +339,38 @@ export default function App() {
       addChatMessage(`Chat service failed: ${err.message}`, 'assistant');
     } finally {
       setIsSendingChat(false);
+    }
+  };
+
+  const handleAttachmentChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0] || null;
+    setChatAttachment(file);
+  };
+
+  const handleUploadAttachment = async () => {
+    if (!chatAttachment) return;
+    const latestMessage = chatMessages[chatMessages.length - 1];
+    if (!latestMessage || latestMessage.role !== 'user' || !latestMessage.id) return;
+
+    setChatUploadingAttachment(true);
+    try {
+      const data = await uploadChatAttachment(latestMessage.id, chatAttachment);
+      if (data.success) {
+        setChatMessages((prev) => prev.map((msg) => {
+          if (msg.id === latestMessage.id) {
+            return {
+              ...msg,
+              attachments: [...(msg.attachments || []), data.attachment]
+            };
+          }
+          return msg;
+        }));
+      }
+    } catch (err) {
+      console.warn('Attachment upload failed', err);
+    } finally {
+      setChatUploadingAttachment(false);
+      setChatAttachment(null);
     }
   };
 
@@ -999,6 +1043,22 @@ export default function App() {
                                   <span>{msg.role === 'assistant' ? 'Thesis AI' : 'User'}</span>
                                 </div>
                                 <p className="text-xs leading-relaxed text-zinc-200 whitespace-pre-wrap">{msg.content}</p>
+                                {msg.attachments?.length ? (
+                                  <div className="pt-2 space-y-2">
+                                    {msg.attachments.map((attachment) => (
+                                      <a
+                                        key={attachment.id}
+                                        href={attachment.url}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="inline-flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900 px-3 py-2 text-[10px] uppercase tracking-widest text-emerald-300 hover:bg-zinc-800"
+                                      >
+                                        <FileText className="w-3 h-3" />
+                                        {attachment.filename}
+                                      </a>
+                                    ))}
+                                  </div>
+                                ) : null}
                               </div>
                             ))
                           )}
@@ -1011,15 +1071,45 @@ export default function App() {
                             placeholder="Ask DipGuard about the AI boom, defense demand, European cloud spend, semis supply, gold hedge, or global ETF rotation..."
                             className="w-full bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-xs text-zinc-200 font-mono focus:outline-none focus:border-emerald-500"
                           />
-                          <div className="flex items-center justify-between gap-3">
-                            <span className="text-[10px] text-zinc-500">All responses will anchor to the current thesis seed.</span>
-                            <button
-                              type="submit"
-                              disabled={isSendingChat}
-                              className="bg-emerald-600 hover:bg-emerald-500 text-zinc-950 font-black px-4 py-2 rounded text-xs transition-colors focus:ring-2 focus:ring-emerald-500 focus:outline-none disabled:opacity-40"
-                            >
-                              {isSendingChat ? 'SYNTHESIZING RESPONSE...' : 'SEND MESSAGE'}
-                            </button>
+                          <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
+                            <div className="space-y-2">
+                              <label className="block text-[10px] uppercase tracking-widest text-zinc-500">Attach image / PDF</label>
+                              <input
+                                type="file"
+                                accept="image/*,.pdf"
+                                onChange={handleAttachmentChange}
+                                className="w-full rounded border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-zinc-200"
+                              />
+                              {chatAttachment ? (
+                                <div className="flex items-center justify-between gap-2 rounded border border-zinc-800 bg-zinc-900 px-3 py-2 text-[10px] text-zinc-300">
+                                  <span>{chatAttachment.name}</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => setChatAttachment(null)}
+                                    className="text-emerald-300 hover:text-white"
+                                  >
+                                    Clear
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
+                            <div className="space-y-2">
+                              <button
+                                type="button"
+                                disabled={!chatAttachment || chatUploadingAttachment}
+                                onClick={handleUploadAttachment}
+                                className="w-full bg-sky-600 hover:bg-sky-500 text-zinc-950 font-black px-4 py-2 rounded text-xs transition-colors focus:ring-2 focus:ring-sky-500 focus:outline-none disabled:opacity-40"
+                              >
+                                {chatUploadingAttachment ? 'UPLOADING...' : 'UPLOAD ATTACHMENT'}
+                              </button>
+                              <button
+                                type="submit"
+                                disabled={isSendingChat}
+                                className="w-full bg-emerald-600 hover:bg-emerald-500 text-zinc-950 font-black px-4 py-2 rounded text-xs transition-colors focus:ring-2 focus:ring-emerald-500 focus:outline-none disabled:opacity-40"
+                              >
+                                {isSendingChat ? 'SYNTHESIZING RESPONSE...' : 'SEND MESSAGE'}
+                              </button>
+                            </div>
                           </div>
                         </form>
                       </div>
