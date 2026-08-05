@@ -24,6 +24,22 @@ export const scanTicker = async (ticker: string) => {
     }
 };
 
+export const uploadPdf = async (file: File) => {
+    const body = new FormData();
+    body.append('file', file);
+
+    const response = await fetch(`${API_BASE_URL}/upload-pdf`, {
+        method: 'POST',
+        body,
+    });
+
+    if (!response.ok) {
+        throw new Error('PDF upload failed');
+    }
+
+    return await response.json();
+};
+
 export const generate2FA = async () => {
     const response = await fetch(`${API_BASE_URL}/auth/2fa/generate`, {
         method: 'POST',

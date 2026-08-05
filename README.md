@@ -77,6 +77,8 @@ Edit your agent logic in `app/agent.py` and test with `agents-cli playground` - 
 
 ## Deployment
 
+### Backend
+
 ```bash
 gcloud config set project <your-project-id>
 agents-cli deploy
@@ -84,6 +86,19 @@ agents-cli deploy
 
 To add CI/CD and Terraform, run `agents-cli scaffold enhance`.
 To set up your production infrastructure, run `agents-cli infra cicd`.
+
+### Frontend on Cloudflare Pages
+
+This app is well suited for Cloudflare Pages as a static React/Vite frontend.
+
+- Build command: `npm install && npm run build`
+- Publish directory: `dist`
+- Environment variable: `VITE_API_URL=https://<your-render-backend>.onrender.com/api`
+
+When the frontend is deployed, set the Render backend env var:
+- `ALLOW_ORIGINS=https://<your-pages-site>.pages.dev`
+
+If you host the backend on Render and frontend on Cloudflare Pages, the frontend will call the backend through `VITE_API_URL` and Render will allow the Pages origin via `ALLOW_ORIGINS`.
 
 ## Features
 
@@ -122,5 +137,25 @@ Built-in telemetry exports to Cloud Trace, BigQuery, and Cloud Logging.
 
 ## A2A Inspector
 
-This agent supports the [A2A Protocol](https://a2a-protocol.org/). Use the [A2A Inspector](https://github.com/a2aproject/a2a-inspector) to test interoperability.
+This agent supports the [A2A Protocol](https://a2aprotocol.org/). Use the [A2A Inspector](https://github.com/a2aproject/a2a-inspector) to test interoperability.
 See the [A2A Inspector docs](https://github.com/a2aproject/a2a-inspector) for details.
+
+## Deploying the Backend to Render.com
+
+Render can host the backend as a Web Service directly from the repository.
+
+1. Push this repository to GitHub or GitLab.
+2. Create a new Web Service in Render and connect your repo.
+3. Set the service root to `backend`.
+4. Use these commands:
+   - Build command: `npm install`
+   - Start command: `npm run start`
+   - Health check path: `/health`
+5. Set required environment variables in Render:
+   - `GEMINI_API_KEY` (optional; use for Gemini API access)
+   - `GOOGLE_CLOUD_PROJECT`
+   - `GOOGLE_CLOUD_LOCATION`
+   - `APP_URL` (your Render service URL)
+   - `ALLOW_ORIGINS` (optional; e.g. `https://<your-frontend>.onrender.com`)
+
+> If you want only the backend on Render, host the frontend separately and point `ALLOW_ORIGINS` to the frontend URL.

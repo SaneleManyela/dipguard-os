@@ -8,16 +8,80 @@ import {
   TrendingDown, Globe, BookOpen, Sliders, DollarSign, Activity, 
   Layers, AlertTriangle, HelpCircle, ShieldAlert, Sparkles, 
   Search, Cpu, ArrowDownRight, Compass, CheckCircle2, ChevronRight, 
-  ArrowUpRight, Info, RefreshCw, Layers3, Flame, Clock, Landmark
+  ArrowUpRight, Info, RefreshCw, Layers3, Flame, Clock, Landmark, UploadCloud, FileText
 } from 'lucide-react';
-import { OpportunityAlert, ScheduledReport, LiveActivityLog, BriefType } from './types';
+import { createWorker } from 'tesseract.js';
+import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist';
+import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.mjs';
+import { OpportunityAlert, ScheduledReport, LiveActivityLog, BriefType } from './types/types';
 import ActivityLogs from './components/ActivityLogs';
 import PlaygroundView from './components/PlaygroundView';
 
+GlobalWorkerOptions.workerSrc = pdfjsWorker;
+
+function extractTickersFromText(text: string) {
+  const found = Array.from(text.matchAll(/\b[A-Z]{2,5}\b/g), (match) => match[0]);
+  const exclude = new Set([
+    'THE', 'AND', 'FOR', 'WITH', 'THIS', 'THAT', 'FROM', 'YOUR', 'THERE', 'WHICH', 'WHILE', 'WHERE', 'BUT', 'NOT',
+    'ARE', 'HAS', 'HAVE', 'WAS', 'WILL', 'SHOULD', 'COULD', 'MAY', 'ETF', 'USD', 'ZAR', 'SAST', 'AI', 'GPU', 'CEO', 'CFO',
+    'NASDAQ', 'JSE', 'NYSE', 'EQUITY', 'STOCK', 'MARKET', 'FUTURES', 'OPTIONS', 'NEWS', 'NOTE', 'DATA', 'RISK',
+    'RATE', 'TAX', 'FEE', 'YIELD', 'BOND'
+  ]);
+
+  return Array.from(new Set(found.filter((ticker) => {
+    if (exclude.has(ticker)) return false;
+    if (ticker.length < 2 || ticker.length > 5) return false;
+    return true;
+  })));
+}
+
+async function extractTextFromPdf(file: File) {
+  const raw = await file.arrayBuffer();
+  const loadingTask = getDocument({ data: raw });
+  const pdf = await loadingTask.promise;
+  let fullText = '';
+  for (let pageIndex = 1; pageIndex <= pdf.numPages; pageIndex += 1) {
+    const page = await pdf.getPage(pageIndex);
+    const content = await page.getTextContent();
+    const pageText = content.items.map((item: any) => item.str || '').join(' ');
+    fullText += pageText + '\n';
+  }
+  return fullText;
+}
+
+async function runPdfOcr(file: File) {
+  const raw = await file.arrayBuffer();
+  const loadingTask = getDocument({ data: raw });
+  const pdf = await loadingTask.promise;
+  const worker = (await createWorker()) as any;
+  await worker.load();
+  await worker.loadLanguage?.('eng');
+  await worker.initialize?.('eng');
+
+  let ocrText = '';
+  const maxPages = Math.min(pdf.numPages, 6);
+  for (let pageIndex = 1; pageIndex <= maxPages; pageIndex += 1) {
+    const page = await pdf.getPage(pageIndex);
+    const viewport = page.getViewport({ scale: 1.5 });
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    const context = canvas.getContext('2d');
+    if (context) {
+      await page.render({ canvasContext: context, viewport, canvas }).promise;
+      const result = await worker.recognize(canvas);
+      ocrText += (result.data?.text || '') + '\n';
+    }
+  }
+
+  await worker.terminate();
+  return ocrText;
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'alerts' | 'publications' | 'scanner' | 'playground' | 'portfolio' | 'reference'>('alerts');
+  const [activeTab, setActiveTab] = useState<'alerts' | 'publications' | 'scanner' | 'playground' | 'portfolio' | 'reference' | 'chat'>('alerts');
   const [sastTime, setSastTime] = useState<string>('00:00:00');
-  const [hasGeminiKey, setHasGeminiKey] = useState<boolean>(false);
+  const [hasReplicateKey, setHasReplicateKey] = useState<boolean>(false);
   
   // Data State
   const [alerts, setAlerts] = useState<OpportunityAlert[]>([]);
@@ -34,10 +98,23 @@ export default function App() {
   const [isScanning, setIsScanning] = useState(false);
   const [activeScanResult, setActiveScanResult] = useState<OpportunityAlert | null>(null);
 
+  const [pdfUploadStatus, setPdfUploadStatus] = useState<string>('');
+  const [trackedTickers, setTrackedTickers] = useState<string[]>([]);
+  const [pdfExtractedSnippet, setPdfExtractedSnippet] = useState<string>('');
+  const [isUploadingPdf, setIsUploadingPdf] = useState(false);
+
   // Dynamic Brief State
   const [briefType, setBriefType] = useState<BriefType>('Morning Brief (07:00)');
   const [customFocus, setCustomFocus] = useState('');
   const [isGeneratingBrief, setIsGeneratingBrief] = useState(false);
+
+  // Chat + Thesis Prompt Inputs
+  const [thesisPrompt, setThesisPrompt] = useState<string>('');
+  const [thesisDraft, setThesisDraft] = useState<string>('');
+  const [chatInput, setChatInput] = useState<string>('');
+  const [chatMessages, setChatMessages] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
+  const [isSendingChat, setIsSendingChat] = useState(false);
+  const [isUpdatingThesis, setIsUpdatingThesis] = useState(false);
 
   // Currency Converter Inputs
   const [randAmount, setRandAmount] = useState<string>('50000');
@@ -102,7 +179,7 @@ export default function App() {
     fetch('/api/config-status')
       .then((res) => res.json())
       .then((data) => {
-        setHasGeminiKey(data.hasGeminiKey);
+        setHasReplicateKey(data.hasReplicateKey);
       })
       .catch((err) => console.warn('Could not connect to config-status endpoint', err));
 
@@ -119,33 +196,47 @@ export default function App() {
         }
       })
       .catch((err) => console.warn('Could not load historical alerts data', err));
+
+    // Current shared thesis prompt
+    fetch('/api/thesis')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.success) {
+          setThesisPrompt(data.thesis || '');
+          setThesisDraft(data.thesis || '');
+        }
+      })
+      .catch((err) => console.warn('Could not load thesis prompt', err));
   }, []);
 
   // Trigger Ticker Scan
-  const handlePerformScan = async (e: FormEvent) => {
-    e.preventDefault();
+  const performTickerScan = async (
+    ticker: string,
+    name: string,
+    tier: number,
+    market: 'NASDAQ' | 'JSE' | 'ETF' | 'OTHER',
+    recentChange: number
+  ) => {
     setIsScanning(true);
     setActiveScanResult(null);
 
-    // Inject alert injection log
-    addNewLog(`Triggered custom client-side scan query on target asset: ${scanTicker} (${scanMarket})`, 'info');
+    addNewLog(`Triggered custom client-side scan query on target asset: ${ticker} (${market})`, 'info');
 
     try {
       const response = await fetch('/api/scan-ticker', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          ticker: scanTicker,
-          name: scanName,
-          tier: scanTier,
-          market: scanMarket,
-          recentChange: scanChange,
+          ticker,
+          name,
+          tier,
+          market,
+          recentChange,
         }),
       });
       const data = await response.json();
       if (data.success) {
         setActiveScanResult(data.alert);
-        // Also prepend this new alert to the alerts list
         setAlerts((prev) => [data.alert, ...prev]);
 
         addNewLog(
@@ -159,6 +250,109 @@ export default function App() {
       addNewLog(`Error dispatching pipeline scan: ${err.message}`, 'alert');
     } finally {
       setIsScanning(false);
+    }
+  };
+
+  const handlePerformScan = async (e: FormEvent) => {
+    e.preventDefault();
+    await performTickerScan(scanTicker, scanName, scanTier, scanMarket, scanChange);
+  };
+
+  const handleScanTrackedTicker = async (ticker: string) => {
+    await performTickerScan(ticker, ticker, 2, 'NASDAQ', -4.5);
+  };
+
+  const handleUploadPdf = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const form = e.currentTarget;
+    const fileInput = form.elements.namedItem('pdfFile') as HTMLInputElement | null;
+    const file = fileInput?.files?.[0];
+
+    if (!file) {
+      setPdfUploadStatus('Please select a PDF file to upload.');
+      return;
+    }
+
+    setIsUploadingPdf(true);
+    setPdfUploadStatus('Parsing PDF and extracting text from pages...');
+
+    try {
+      const pdfText = await extractTextFromPdf(file);
+      const imageText = await runPdfOcr(file);
+      const combinedText = [pdfText, imageText].filter(Boolean).join('\n');
+      const tickers = extractTickersFromText(combinedText);
+
+      setTrackedTickers(tickers);
+      setPdfExtractedSnippet(combinedText.slice(0, 700));
+      setPdfUploadStatus(
+        tickers.length > 0
+          ? `Detected ${tickers.length} potential tickers from PDF text and images.`
+          : 'No valid ticker-like symbols found. Please verify the document contains uppercase stock symbols.'
+      );
+      addNewLog(`PDF parsed locally. Extracted ${tickers.length} candidate tickers from embedded text and images.`, 'system');
+    } catch (err: any) {
+      setPdfUploadStatus(`PDF parser error: ${err.message}`);
+      addNewLog(`PDF extraction failed: ${err.message}`, 'alert');
+    } finally {
+      setIsUploadingPdf(false);
+    }
+  };
+
+  const addChatMessage = (message: string, role: 'user' | 'assistant') => {
+    setChatMessages((prev) => [...prev, { role, content: message }]);
+  };
+
+  const handleSendChat = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!chatInput.trim()) return;
+
+    const messageToSend = chatInput.trim();
+    addChatMessage(messageToSend, 'user');
+    setChatInput('');
+    setIsSendingChat(true);
+
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: messageToSend }),
+      });
+      const data = await response.json();
+      if (data.success) {
+        addChatMessage(data.response, 'assistant');
+      } else {
+        addChatMessage(`Error: ${data.error || 'Failed to get a response.'}`, 'assistant');
+      }
+    } catch (err: any) {
+      addChatMessage(`Chat service failed: ${err.message}`, 'assistant');
+    } finally {
+      setIsSendingChat(false);
+    }
+  };
+
+  const handleUpdateThesis = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const draft = thesisDraft.trim();
+    if (!draft) return;
+
+    setIsUpdatingThesis(true);
+    try {
+      const response = await fetch('/api/thesis', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ thesis: draft }),
+      });
+      const data = await response.json();
+      if (data.success) {
+        setThesisPrompt(data.thesis);
+        addNewLog('Updated chat thesis prompt for all future DipGuard interactions.', 'analysis');
+      } else {
+        addNewLog(`Unable to update thesis prompt: ${data.error || 'unknown error'}`, 'alert');
+      }
+    } catch (err: any) {
+      addNewLog(`Thesis update failed: ${err.message}`, 'alert');
+    } finally {
+      setIsUpdatingThesis(false);
     }
   };
 
@@ -262,7 +456,7 @@ export default function App() {
             </span>
           </div>
           <div className="hidden md:flex items-center gap-2 border-l border-zinc-800 pl-4 text-[11px] text-zinc-500 tracking-wider">
-            <span>MODEL: GEMINI-3.5-FLASH</span>
+            <span>MODEL: IBM GRANITE 3.1 8B INSTRUCT</span>
           </div>
         </div>
       </div>
@@ -304,9 +498,9 @@ export default function App() {
             <div>
               <span className="block text-[9px] text-zinc-500 uppercase tracking-widest font-mono font-bold">AI SYNAPSES ACTIVE</span>
               <div className="flex items-center gap-2 mt-0.5">
-                <span className={`w-2.5 h-2.5 rounded-full ${hasGeminiKey ? 'bg-emerald-500' : 'bg-amber-400 animate-pulse'}`} />
+                <span className={`w-2.5 h-2.5 rounded-full ${hasReplicateKey ? 'bg-emerald-500' : 'bg-amber-400 animate-pulse'}`} />
                 <span className="text-xs font-mono font-bold text-zinc-300 uppercase">
-                  {hasGeminiKey ? 'Gemini Premium Mode' : 'Offline Sandboxed Hybrid'}
+                  {hasReplicateKey ? 'Replicate Granite Mode' : 'Offline Sandboxed Hybrid'}
                 </span>
               </div>
             </div>
@@ -742,6 +936,99 @@ export default function App() {
               </div>
             )}
 
+            {/* TAB 2.5: THESIS-PRIMED CHAT INTERFACE */}
+            {activeTab === 'chat' && (
+              <div className="space-y-6">
+                <div className="bg-zinc-950 border border-zinc-800 p-6 rounded-xl space-y-6">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <h3 className="text-lg font-bold text-white font-mono uppercase tracking-wider flex items-center gap-2">
+                        <Activity className="w-5 h-5 text-emerald-400" />
+                        <span>Thesis-Primed Market Chat</span>
+                      </h3>
+                      <p className="text-xs text-zinc-400 mt-0.5">
+                        Keep the whole DipGuard conversation anchored to your investment themes and ask questions in natural language.
+                      </p>
+                    </div>
+                    <div className="text-xs text-zinc-500 font-mono">
+                      Active thesis prompt loaded from server state.
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 xl:grid-cols-12 gap-4">
+                    <div className="xl:col-span-5 space-y-4 bg-zinc-900/60 border border-zinc-800 p-4 rounded-xl">
+                      <h4 className="text-xs uppercase text-zinc-400 font-bold tracking-widest">Current Thesis Seed</h4>
+                      <div className="text-[11px] text-zinc-300 leading-relaxed whitespace-pre-wrap font-sans">
+                        {thesisPrompt || 'No thesis prompt loaded yet.'}
+                      </div>
+                      <form onSubmit={handleUpdateThesis} className="space-y-3">
+                        <label className="text-[10px] font-mono uppercase tracking-widest text-zinc-500">Edit thesis seed for all future chats</label>
+                        <textarea
+                          value={thesisDraft}
+                          onChange={(e) => setThesisDraft(e.target.value)}
+                          rows={8}
+                          className="w-full bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-xs text-zinc-200 font-mono focus:outline-none focus:border-emerald-500"
+                        />
+                        <button
+                          type="submit"
+                          disabled={isUpdatingThesis}
+                          className="w-full bg-emerald-600 hover:bg-emerald-500 text-zinc-950 font-black px-4 py-2 rounded text-xs transition-colors focus:ring-2 focus:ring-emerald-500 focus:outline-none disabled:opacity-40"
+                        >
+                          {isUpdatingThesis ? 'UPDATING THESIS...' : 'UPDATE THESIS PROMPT'}
+                        </button>
+                      </form>
+                    </div>
+
+                    <div className="xl:col-span-7 space-y-4">
+                      <div className="bg-zinc-900/60 border border-zinc-800 p-4 rounded-xl space-y-4">
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <h4 className="text-sm font-bold text-white font-mono">DipGuard Chat Console</h4>
+                            <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-mono">Ask about AI, semiconductors, cloud, defense, water, finance, property, gold, ETFs, and more.</p>
+                          </div>
+                          <span className="text-[10px] text-emerald-400 font-bold uppercase">Thesis-bound response mode</span>
+                        </div>
+                        <div className="space-y-3 h-[420px] overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-950 p-4 text-xs text-zinc-200">
+                          {chatMessages.length === 0 ? (
+                            <div className="text-zinc-500">No chat history yet. Send a message to begin the thesis-primed conversation.</div>
+                          ) : (
+                            chatMessages.map((msg, idx) => (
+                              <div key={idx} className={`space-y-1 p-3 rounded-xl ${msg.role === 'assistant' ? 'bg-zinc-900 border border-emerald-900/30' : 'bg-zinc-950 border border-zinc-800'}`}>
+                                <div className="flex items-center justify-between gap-2 text-[10px] uppercase tracking-widest font-bold text-zinc-500">
+                                  <span>{msg.role === 'assistant' ? 'DipGuard' : 'You'}</span>
+                                  <span>{msg.role === 'assistant' ? 'Thesis AI' : 'User'}</span>
+                                </div>
+                                <p className="text-xs leading-relaxed text-zinc-200 whitespace-pre-wrap">{msg.content}</p>
+                              </div>
+                            ))
+                          )}
+                        </div>
+                        <form onSubmit={handleSendChat} className="space-y-3">
+                          <textarea
+                            value={chatInput}
+                            onChange={(e) => setChatInput(e.target.value)}
+                            rows={4}
+                            placeholder="Ask DipGuard about the AI boom, defense demand, European cloud spend, semis supply, gold hedge, or global ETF rotation..."
+                            className="w-full bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-xs text-zinc-200 font-mono focus:outline-none focus:border-emerald-500"
+                          />
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="text-[10px] text-zinc-500">All responses will anchor to the current thesis seed.</span>
+                            <button
+                              type="submit"
+                              disabled={isSendingChat}
+                              className="bg-emerald-600 hover:bg-emerald-500 text-zinc-950 font-black px-4 py-2 rounded text-xs transition-colors focus:ring-2 focus:ring-emerald-500 focus:outline-none disabled:opacity-40"
+                            >
+                              {isSendingChat ? 'SYNTHESIZING RESPONSE...' : 'SEND MESSAGE'}
+                            </button>
+                          </div>
+                        </form>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* TAB 3: TARGETED QUANT ASSET SCANNER */}
             {activeTab === 'scanner' && (
               <div className="space-y-6">
@@ -960,6 +1247,86 @@ export default function App() {
                     <p className="text-xs text-zinc-400 mt-0.5">
                       Configure monthly capital distribution based on strict prioritizations and exchange rate adjustments.
                     </p>
+                  </div>
+
+                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                    <div className="bg-zinc-900/40 p-5 rounded-xl border border-zinc-800">
+                      <div className="flex items-center gap-2 text-xs font-mono font-bold text-emerald-400 mb-4">
+                        <UploadCloud className="w-4 h-4 text-emerald-400" />
+                        <span>Upload PDF for stock tracking</span>
+                      </div>
+
+                      <form onSubmit={handleUploadPdf} className="space-y-4">
+                        <div>
+                          <label className="block text-[10px] text-zinc-400 uppercase font-mono font-bold mb-2">Upload document</label>
+                          <input
+                            type="file"
+                            name="pdfFile"
+                            accept="application/pdf"
+                            className="w-full text-xs text-zinc-200 file:bg-zinc-900 file:border file:border-zinc-800 file:px-3 file:py-2 file:text-zinc-100 file:rounded-lg"
+                          />
+                        </div>
+
+                        <button
+                          type="submit"
+                          disabled={isUploadingPdf}
+                          className="w-full bg-emerald-600 hover:bg-emerald-500 text-zinc-950 font-black px-4 py-2.5 rounded text-xs transition-colors flex items-center justify-center gap-2 focus:ring-2 focus:ring-emerald-500 focus:outline-none disabled:opacity-40"
+                        >
+                          {isUploadingPdf ? (
+                            <>
+                              <RefreshCw className="w-4 h-4 animate-spin" />
+                              <span>ANALYZING PDF...</span>
+                            </>
+                          ) : (
+                            <>
+                              <FileText className="w-4 h-4" />
+                              <span>PARSE PDF & EXTRACT TICKERS</span>
+                            </>
+                          )}
+                        </button>
+                      </form>
+
+                      <div className="mt-4 text-xs text-zinc-300 space-y-3">
+                        <p className="text-zinc-400">{pdfUploadStatus || 'Upload a PDF containing your portfolio notes, watchlists, or stock research to extract ticker symbols automatically.'}</p>
+                        {pdfExtractedSnippet && (
+                          <div className="bg-zinc-950 border border-zinc-800 p-3 rounded-lg text-[11px] text-zinc-300">
+                            <div className="font-mono uppercase text-[9px] text-zinc-500 mb-2">Extracted PDF snippet</div>
+                            <p className="whitespace-pre-line">{pdfExtractedSnippet}</p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="bg-zinc-900/40 p-5 rounded-xl border border-zinc-800 space-y-4">
+                      <div className="flex items-center gap-2 text-xs font-mono font-bold text-emerald-400">
+                        <FileText className="w-4 h-4" />
+                        <span>Tracked tickers from PDF</span>
+                      </div>
+
+                      {trackedTickers.length > 0 ? (
+                        <div className="space-y-3">
+                          {trackedTickers.map((ticker) => (
+                            <div key={ticker} className="bg-zinc-950 border border-zinc-800 rounded-xl p-3 flex items-center justify-between gap-3">
+                              <div>
+                                <div className="text-xs uppercase tracking-widest text-zinc-500 font-mono">Ticker</div>
+                                <div className="text-lg font-bold text-white font-mono">{ticker}</div>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => handleScanTrackedTicker(ticker)}
+                                className="text-[10px] font-bold uppercase tracking-wider px-3 py-2 rounded border border-emerald-500 text-emerald-400 hover:bg-emerald-500/10 transition-colors"
+                              >
+                                Scan Dip
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="text-xs text-zinc-500">
+                          No tickers extracted yet. Upload a PDF and let DipGuard detect the symbols to track.
+                        </div>
+                      )}
+                    </div>
                   </div>
 
                   {/* USD/ZAR Currency impacts and converter interactive */}

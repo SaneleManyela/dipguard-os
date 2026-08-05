@@ -1,5 +1,5 @@
 import { useState, useEffect, FormEvent } from 'react';
-import { LiveActivityLog } from '../types';
+import { LiveActivityLog } from '../types/types';
 import { Terminal, Send, AlertTriangle, ShieldCheck, Cpu } from 'lucide-react';
 
 interface ActivityLogsProps {

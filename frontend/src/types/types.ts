@@ -102,6 +102,12 @@ export interface PortfolioHolding {
   weight?: number;
 }
 
+export interface PdfUploadResult {
+  trackedTickers: string[];
+  summary: string;
+  extractedTextSnippet: string;
+}
+
 export interface CapitalAllocationPlan {
   cashAvailable: number;
   recommendations: AllocationRecommendation[];
@@ -132,7 +138,7 @@ export interface LiveActivityLog {
     | 'alert'
     | 'analysis'
     | 'agent'
-    | 'system';
-
+    | 'system'
+    | 'jensen_trump';
   message: string;
 }

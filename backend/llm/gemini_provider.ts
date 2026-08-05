@@ -1,5 +1,6 @@
 import { LLMProvider } from './base_provider';
 
+// Deprecated legacy provider. Current production integration uses Replicate IBM Granite 3.1 8B Instruct.
 export class GeminiProvider implements LLMProvider {
     private apiKey: string;
 

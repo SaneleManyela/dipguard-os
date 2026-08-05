@@ -1,12 +1,12 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { runQuantAgent } from '../services/quant_orchestrator';
-import { GeminiProvider } from '../llm/gemini_provider';
+import { ReplicateProvider } from '../llm/replicate_provider';
 import { requireAuth } from '../middleware/auth';
 import { cacheMiddleware } from '../services/cache';
 
 const router = Router();
-const llm = new GeminiProvider();
+const llm = new ReplicateProvider();
 
 // SEC-01: Zod Input Validation Schema
 const ScanRequestSchema = z.object({

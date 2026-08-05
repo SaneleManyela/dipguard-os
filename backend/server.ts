@@ -1,11 +1,14 @@
-import express from "express";
+import express, { Request, Response } from "express";
 import path from "path";
-import { GoogleGenAI, Type } from "@google/genai";
+import { createServer as createViteServer } from 'vite';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
+import multer from 'multer';
+import pdfParse from 'pdf-parse';
 import dotenv from "dotenv";
 import scannerRouter from './routes/scanner';
 import { startScheduler } from './services/scheduler';
+import { ReplicateProvider } from './llm/replicate_provider';
 
 dotenv.config({ path: '../.env' });
 
@@ -20,6 +23,33 @@ app.use(cors({
 
 app.use(express.json());
 
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 }
+});
+
+const PDF_TICKER_EXCLUDE = new Set([
+  'THE', 'AND', 'FOR', 'WITH', 'THIS', 'THAT', 'FROM', 'YOUR', 'THERE', 'WHICH', 'WHILE', 'WHERE', 'BUT', 'NOT',
+  'ARE', 'HAS', 'HAVE', 'WAS', 'WILL', 'SHOULD', 'COULD', 'MAY', 'ETF', 'USD', 'ZAR', 'SAST', 'AI', 'GPU', 'CEO', 'CFO',
+  'NASDAQ', 'JSE', 'NYSE', 'EQUITY', 'STOCK', 'MARKET', 'TRADING', 'FUTURES', 'OPTIONS', 'NEWS', 'NOTE', 'DATA', 'RISK',
+  'RATE', 'TAX', 'FEE', 'YIELD', 'BOND'
+]);
+
+function extractTickersFromText(text: string) {
+  if (!text || typeof text !== 'string') {
+    return [];
+  }
+
+  const matches = Array.from(text.matchAll(/\b[A-Z]{2,5}\b/g), (m) => m[0]);
+  const filtered = matches.filter((symbol) => {
+    if (PDF_TICKER_EXCLUDE.has(symbol)) return false;
+    if (symbol.length < 2 || symbol.length > 5) return false;
+    return true;
+  });
+
+  return Array.from(new Set(filtered)).slice(0, 25);
+}
+
 // SEC-05: Rate Limiting to prevent DoS (Layer 9)
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
@@ -33,30 +63,46 @@ import authRouter from './routes/auth';
 app.use('/api/auth', authRouter);
 app.use('/api', apiLimiter, scannerRouter);
 
-app.get('/health', (req, res) => {
+app.get('/health', (req: Request, res: Response) => {
     res.json({ status: 'ok', service: 'DipGuard Node Backend' });
 });
 
 const PORT = process.env.PORT || 3000;
 
-// Initialize server-side Gemini client lazily
-let aiClient: GoogleGenAI | null = null;
-function getGeminiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === "MY_GEMINI_API_KEY" || apiKey.trim() === "") {
-    return null;
+const replicateProvider = new ReplicateProvider();
+
+async function getReplicateResponse(prompt: string): Promise<string> {
+  try {
+    return await replicateProvider.generateResponse(prompt);
+  } catch (error) {
+    console.error('Replicate provider error:', error);
+    throw error;
   }
-  if (!aiClient) {
-    aiClient = new GoogleGenAI({
-      apiKey: apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        }
-      }
-    });
-  }
-  return aiClient;
+}
+
+function hasReplicateToken(): boolean {
+  return !!process.env.REPLICATE_API_TOKEN && process.env.REPLICATE_API_TOKEN.trim() !== '';
+}
+
+let currentThesisPrompt = `This conversation is primed by a shared DipGuard chat seed with a strong focus on the following investment themes:
+- Artificial Intelligence
+- Semiconductors
+- Cloud Computing
+- Space Economy
+- Defence
+- Telecommunications
+- Water Infrastructure
+- Digital Infrastructure
+- Banking
+- Digital Finance (SoFi)
+- Property
+- Gold
+- Global ETFs
+
+All future analysis, briefing output, and chat responses should stay centered on these topics and use them as the core thesis for market narrative, econophysics scoring, and portfolio recommendations.`;
+
+function getCurrentThesisPrompt() {
+  return currentThesisPrompt;
 }
 
 // Global state / Cache for latest generated reports context
@@ -212,16 +258,16 @@ function getMockReports() {
 }
 
 // REST GET Api: Returns diagnostic/status information
-app.get("/api/config-status", (req, res) => {
-  const hasKey = !!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY";
+app.get("/api/config-status", (req: Request, res: Response) => {
+  const hasKey = hasReplicateToken();
   res.json({
-    hasGeminiKey: hasKey,
+    hasReplicateKey: hasKey,
     currentSastTime: new Date().toLocaleString("en-US", { timeZone: "Africa/Johannesburg" }),
   });
 });
 
 // REST GET Api: Fetch baseline reports and alerts
-app.get("/api/historical-reports", (req, res) => {
+app.get("/api/historical-reports", (req: Request, res: Response) => {
   res.json({
     success: true,
     reports: getMockReports(),
@@ -229,8 +275,84 @@ app.get("/api/historical-reports", (req, res) => {
   });
 });
 
-// REST POST Api: Scan a Ticker using Gemini or Mock
-app.post("/api/scan-ticker", async (req, res) => {
+// REST POST Api: Upload and parse a PDF to extract ticker symbols for tracking
+app.post('/api/upload-pdf', upload.single('file'), async (req: Request, res: Response) => {
+  try {
+    const file = req.file as Express.Multer.File | undefined;
+    if (!file) {
+      return res.status(400).json({ success: false, error: 'PDF file is required.' });
+    }
+
+    const parsed = await pdfParse(file.buffer);
+    const text = (parsed.text || '').toString();
+    const trackedTickers = extractTickersFromText(text);
+
+    if (trackedTickers.length === 0) {
+      return res.json({
+        success: true,
+        trackedTickers: [],
+        summary: 'No clear ticker symbols were detected in the uploaded PDF. Please verify that your document contains uppercase tickers like NVDA, MSFT, PLTR, or JSE codes like SHP.',
+        extractedTextSnippet: text.slice(0, 650)
+      });
+    }
+
+    return res.json({
+      success: true,
+      trackedTickers,
+      summary: `Detected ${trackedTickers.length} potential ticker symbols from your PDF. Use the portfolio scanner to validate and track dips for these tickers.`,
+      extractedTextSnippet: text.slice(0, 650)
+    });
+  } catch (error: any) {
+    console.error('PDF upload error:', error);
+    res.status(500).json({ success: false, error: 'Failed to parse the uploaded PDF file.' });
+  }
+});
+
+// REST GET Api: Retrieve the current thesis priming prompt
+app.get('/api/thesis', (req: Request, res: Response) => {
+  res.json({ success: true, thesis: getCurrentThesisPrompt() });
+});
+
+// REST POST Api: Update the thesis priming prompt used by all future chat and report flows
+app.post('/api/thesis', (req: Request, res: Response) => {
+  const { thesis } = req.body;
+  if (!thesis || typeof thesis !== 'string' || thesis.trim().length === 0) {
+    return res.status(400).json({ success: false, error: 'Thesis prompt text is required.' });
+  }
+  currentThesisPrompt = thesis.trim();
+  res.json({ success: true, thesis: currentThesisPrompt });
+});
+
+// REST POST Api: Chat with DipGuard using the current thesis seed
+app.post('/api/chat', async (req: Request, res: Response) => {
+  const { message } = req.body;
+  if (!message || typeof message !== 'string') {
+    return res.status(400).json({ success: false, error: 'Chat message is required.' });
+  }
+
+  const hasApi = hasReplicateToken();
+  const thesisPrompt = getCurrentThesisPrompt();
+  const systemPrompt = `You are DipGuard Quant, a specialized financial intelligence assistant. Maintain the following thesis as the core guidance for every answer:\n${thesisPrompt}`;
+  const userPrompt = `User asks: ${message}`;
+
+  if (!hasApi) {
+    return res.json({
+      success: true,
+      response: `[SIMULATED DipGuard] Using the primed thesis, I would answer: ${message}`
+    });
+  }
+
+  try {
+    const responseText = await getReplicateResponse(`${systemPrompt}\n\n${userPrompt}`);
+    res.json({ success: true, response: responseText.trim() });
+  } catch (err: any) {
+    console.error('Chat endpoint error:', err);
+    res.status(500).json({ success: false, error: err.message || 'Chat generation failed.' });
+  }
+});
+
+// REST POST Api: Scan a Ticker using Replicate or Mock
+app.post("/api/scan-ticker", async (req: Request, res: Response) => {
   const { ticker, name, tier, market, recentChange } = req.body;
   const targetTicker = (ticker || "NVDA").toUpperCase();
   const targetName = name || "Selected Target Asset";
@@ -238,10 +360,10 @@ app.post("/api/scan-ticker", async (req, res) => {
   const targetMarket = market || "NASDAQ";
   const targetChange = Number(recentChange) || -4.5;
 
-  const ai = getGeminiClient();
+  const hasApi = hasReplicateToken();
 
-  if (!ai) {
-    // Return high-quality deterministic response if API key is not configured
+  if (!hasApi) {
+    // Return high-quality deterministic response if Replicate API key is not configured
     // Formulate a beautiful prompt simulation output based on financial parameters.
     const scoreFundamentals = Math.min(30, Math.round(25 + Math.random() * 5));
     const scoreNarrative = Math.min(20, Math.round(15 + Math.random() * 5));
@@ -282,7 +404,6 @@ app.post("/api/scan-ticker", async (req, res) => {
   }
 
   try {
-    // Generate with actual Gemini AI
     const systemPrompt = `You are DipGuard Quant, a highly specialized autonomous financial intelligence agent focused on identifying buy-the-dip opportunities using econophysics (Fat Tails, Volatility Clustering, Volume-Price Confirmation, Agent-Based Dynamics, Narrative Detection, Critical Thresholds, Long-Memory Effects). 
 Analyze the asset and output a detailed JSON object. You must return strictly JSON. No markdown wrappers other than plain standard JSON text.
 
@@ -318,17 +439,9 @@ Recent Price Activity: ${targetChange}% drop.
 
 Consider the recent news surrounding this company and the broader markets (NASDAQ, S&P 500, JSE etc.) or any commentary from relevant influencers like Jensen Huang or Donald Trump. Determine high-fidelity scores and classification. Include deep quantitative and physical economics jargon.`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        systemInstruction: systemPrompt,
-        responseMimeType: "application/json"
-      }
-    });
+    const responseText = await getReplicateResponse(`${systemPrompt}\n\n${prompt}`);
+    const parsedData = JSON.parse(responseText);
 
-    const parsedData = JSON.parse(response.text.trim());
-    
     // Ensure all target inputs are maintained and scores add up
     parsedData.id = "scan-" + Date.now();
     parsedData.ticker = targetTicker;
@@ -337,7 +450,7 @@ Consider the recent news surrounding this company and the broader markets (NASDA
     parsedData.market = targetMarket;
     parsedData.changePercent = targetChange;
     parsedData.timestamp = new Date().toISOString();
-    
+
     // Ensure correct schema scoring limits and sum
     if (parsedData.scores) {
       const f = Math.min(30, parsedData.scores.fundamentals || 0);
@@ -353,7 +466,7 @@ Consider the recent news surrounding this company and the broader markets (NASDA
         tailwind: t,
         total: f + n + v + d + t
       };
-      
+
       if (parsedData.scores.total >= 80) {
         parsedData.classification = "Strong Buy Opportunity";
       } else if (parsedData.scores.total < 60) {
@@ -365,18 +478,18 @@ Consider the recent news surrounding this company and the broader markets (NASDA
 
     res.json({ success: true, alert: parsedData });
   } catch (err: any) {
-    console.error("Gemini Scan Error:", err);
+    console.error("Replicate Scan Error:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// REST POST Api: Generate custom briefings/scans using Gemini or Mock
+// REST POST Api: Generate custom briefings/scans using Replicate or Mock
 app.post("/api/generate-briefing", async (req, res) => {
   const { briefType, customFocus } = req.body;
   const typeStr = briefType || "Morning Brief (07:00)";
-  const ai = getGeminiClient();
+  const hasApi = hasReplicateToken();
 
-  if (!ai) {
+  if (!hasApi) {
     // Generate a beautiful offline detailed report context
     const timestamp = new Date().toISOString();
     const offlineReport = {
@@ -399,8 +512,10 @@ app.post("/api/generate-briefing", async (req, res) => {
   }
 
   try {
+    const thesisPrompt = getCurrentThesisPrompt();
     const systemInstruction = `You are DipGuard Quant, a highly polished financial intelligence quant agent. 
 You must generate a scheduled briefing report focusing on buy-the-dip opportunities. 
+Maintain the following thesis at all times:\n${thesisPrompt}\n
 You must return clean, strict JSON matching this exact structure:
 {
   "executiveSummary": "string describing global tech/JSE sentiment, overnight action, policy shifts",
@@ -414,16 +529,8 @@ You must return clean, strict JSON matching this exact structure:
 Custom user guidance/focus constraints: "${customFocus || 'General monitoring'}"
 Include specific insights on NASDAQ, JSE, and any statements by Jensen Huang or Donald Trump that might affect semiconductors, tariffs, or defense spending. Use advanced econophysics vocabulary. Maintain absolute numeric accuracy and professional, non-promotional tone.`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json"
-      }
-    });
-
-    const body = JSON.parse(response.text.trim());
+    const responseText = await getReplicateResponse(`${systemInstruction}\n\n${prompt}`);
+    const body = JSON.parse(responseText);
 
     // Bundle with specific mock alerts matching the time of day to show high-fidelity visuals
     const reportData = {
@@ -440,7 +547,7 @@ Include specific insights on NASDAQ, JSE, and any statements by Jensen Huang or 
 
     res.json({ success: true, report: reportData });
   } catch (err: any) {
-    console.error("Gemini Briefing Error:", err);
+    console.error("Replicate Briefing Error:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });

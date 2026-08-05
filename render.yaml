@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: dipguard-backend
+    env: node
+    branch: main
+    root: backend
+    buildCommand: npm install
+    startCommand: npm run start
+    healthCheckPath: /health
+    plan: starter
+    envVars:
+      - key: GEMINI_API_KEY
+      - key: GOOGLE_CLOUD_PROJECT
+      - key: GOOGLE_CLOUD_LOCATION
+      - key: APP_URL
+      - key: ALLOW_ORIGINS
